@@ -1,0 +1,53 @@
+# Project Submission - Mixtape Bug Hunt
+
+## AI Usage
+I utilized Claude to assist with the initial onboarding phase of this project. Specifically, I used the AI to help me quickly parse through the logic in the `services/` directory and map out the full end-to-end data flows between the HTTP routes and the database layer. During our review, we flagged and corrected initial mismatches between the generic project brief examples and the actual schema code, ensuring this map is 100% accurate to the codebase. I independently verified all mapped files, route paths, and database relationship structures by reading through the source code myself to ensure complete technical precision before starting any bug fixes.
+
+---
+
+## Codebase Map - File Responsibilities
+
+*   **`models.py`**: Defines the 7 core database models (`User`, `Tag`, `Song`, `ListeningEvent`, `Rating`, `Playlist`, and `Notification`). Notably, playlists and songs are linked via the `playlist_entries` association table, which explicitly utilizes a `position` column to track and enforce the precise sequence of songs within a playlist rather than relying on default database insertion order.
+*   **`routes/`**: This directory isolates the HTTP endpoint definitions (split across `songs.py`, `playlists.py`, `users.py`, and `feed.py`). It is strictly responsible for request routing, input parsing/validation, and response formatting (JSON serialization). It contains no core business logic, instead delegating processing immediately to the service tier.
+*   **`services/`**: The core business logic layer of the application. These modules handle data validation rules, database transactions, state persistence logic, and algorithmic calculations (such as tracking user listening streaks in `streak_service.py` or filtering search results in `search_service.py`).
+
+---
+
+## Feature Data Flow Trace (User Rates a Song)
+To understand how the layers communicate, I traced the execution flow of the song rating feature from end to end:
+
+1.  **Route Trigger**: A user initiates a `POST` request to rate a song, which is captured by the endpoint in `routes/songs.py`.
+2.  **Input & Delegation**: The route parses the incoming rating score from the request body and invokes the `rate_song()` function inside the service layer.
+3.  **Service Processing**: Inside `services/`, the system queries the database to check for an existing entry matching the specific `user_id` and `song_id` combination.
+4.  **Persistence**: The service executes an upsert operation—either updating an existing record or instantiating a new row in the `Rating` table (which enforces a unique constraint on user and song pairs). It then commits the database session transaction via SQLAlchemy and returns the updated state back to the route.
+
+---
+
+## Architectural Patterns
+*   **Strict Separation of Concerns (Controller-Service-Model)**: The application cleanly isolates HTTP mechanics from data layout and business rules. Routes serve purely as lightweight controllers that handle request/response formatting, while the `services/` layer completely encapsulates the application's domain logic and state mutations.
+
+---
+
+## Bug Replication Logs
+
+### Issue #1: My listening streak keeps resetting
+*   **Replication Strategy & Steps**: I started by running the project's existing suite with `pytest tests/test_streaks.py -v`. Four tests passed, but `test_streak_increments_on_sunday` failed on `assert u.listening_streak == 2`, with pytest reporting `assert 1 == 2`. To confirm this wasn't a fluke in the test fixture, I called `update_listening_streak()` directly against a fresh `User` with two back-to-back datetimes — Saturday, June 15, 2024 at noon, then Sunday, June 16, 2024 at noon — the same one-day gap the passing "consecutive day" test uses for a Monday/Tuesday pair.
+*   **Observed Behavior**: After the Saturday call, `listening_streak` was correctly `1`. After the Sunday call, instead of incrementing to `2` as it does for every other consecutive-day pair, the streak dropped back to `1` — the same "skipped a day" reset that happens after a real gap. I traced this to `update_listening_streak()` in `services/streak_service.py:73`, where the increment branch is guarded by `days_since_last == 1 and today.weekday() != 6`. That extra `weekday() != 6` clause excludes Sundays from the increment path, so any listen that lands on a Sunday falls through to the `else` branch and resets to `1` even though only one calendar day has passed.
+
+### Issue #2: Friends Listening Now shows people from yesterday
+*   **Replication Strategy & Steps**: I stood up an isolated SQLite database and seeded two friended users (`me` and `alex`) plus one shared song. I inserted a single `ListeningEvent` for `alex` timestamped `now - timedelta(hours=23)`, then hit `GET /feed/<me.id>/listening-now` through the Flask test client to get the real route → `feed_service.get_friends_listening_now()` path, not just the service function in isolation.
+*   **Observed Behavior**: The response came back with `count: 1` and included `alex`'s event, timestamped `2026-07-06T23:40:01` — the calendar day before my local server date of `2026-07-07`. Even though that listen happened "yesterday" by the clock on the wall, it showed up in "Listening Now." Looking at `services/feed_service.py:13`, `RECENT_THRESHOLD = timedelta(hours=24)` is applied as a rolling window (`cutoff = now - RECENT_THRESHOLD`) rather than a calendar-day boundary, so any event under 24 hours old passes the filter regardless of whether it crossed midnight. Anything listened to between roughly 18–23 hours ago reads as "yesterday" to a person but still slips through as "now."
+
+### Issue #3: The same song keeps showing up twice in search
+*   **Replication Strategy & Steps**: Following the pattern already set up in `tests/test_search.py`, I seeded a song with three tags (`rap`, `hip-hop`, `boom bap`) and called `search_songs()` against it, then ran the project's full seed data (`seed_data.py`, 13 songs including several multi-tag ones) through the live `/songs/search` endpoint with a broad query. I also compiled and executed the raw SQL behind `search_songs()` directly against the session to see the join's output independent of the ORM layer.
+*   **Observed Behavior**: This is the one case where I could not force the visible symptom locally. The raw SQL for the `LEFT OUTER JOIN` against `song_tags` in `services/search_service.py:26-27` genuinely returns three rows for my three-tag song — one row per matching tag, confirmed by fetching the compiled statement directly. But when that same query runs through `db.session.query(Song)...all()`, the result list came back with exactly one entry, and my full-dataset run through `/songs/search?q=a` returned 13 results with zero duplicate titles. The legacy ORM `Query` API in this project's installed SQLAlchemy version (2.0.51) auto-deduplicates full-entity rows via the identity map before `.all()` returns them, which masks the missing `.distinct()`/`group_by()` on this query. The underlying defect is real and visible at the SQL level, but it isn't currently reproducible as a user-facing duplicate through this codebase's exact dependency versions — worth noting before I touch the fix, since a naive "add `.distinct()`" change would have no observable effect in my local tests.
+
+---
+
+## Root Cause Analysis & Fixes
+
+### Issue #1: My listening streak keeps resetting
+*   **How I Reproduced It**: I ran `pytest tests/test_streaks.py -v` and observed `test_streak_increments_on_sunday` failing with an expected value mismatch (`assert 1 == 2`). To verify, I manually passed two sequential datetimes (a Saturday at noon and a Sunday at noon) into `update_listening_streak()` for a test user, confirming that the streak incorrectly reset to 1 on Sunday instead of incrementing to 2.
+*   **How I Found the Root Cause**: I navigated to `services/streak_service.py` to inspect `update_listening_streak()`. By tracking how `days_since_last` handles sequential calendar days, I isolated the exact conditional statement guarding the streak increment logic.
+*   **The Root Cause**: The increment branch at line 73 reads `elif days_since_last == 1 and today.weekday() != 6:`. `days_since_last == 1` is the correct, and only, condition the function's own docstring describes for incrementing a streak — "If the user listened yesterday: streak increments by 1." The `and today.weekday() != 6` clause tacks on an unrelated second requirement: Python's `date.weekday()` returns `6` for Sunday, so this clause evaluates to `False` on any Sunday regardless of how many days have actually passed. That single-day-gap case then falls through to the `else` branch and resets `listening_streak` to `1`, even though the user listened on consecutive calendar days. Nothing in the streak rules justifies excluding one specific day of the week from the increment path — it's a stray boundary condition with no matching business rule.
+*   **My Fix and Side-Effect Check**: I removed the `and today.weekday() != 6` clause, leaving the condition as `elif days_since_last == 1:` so the increment path depends only on the actual day gap, matching the documented rule. I reran the full `tests/test_streaks.py` suite after the change: `test_streak_increments_on_sunday` now passes (`listening_streak` correctly reaches `2`), and the other four tests — new user starting at `1`, consecutive weekday increments, same-day no-op, and multi-day gap reset — all still pass unchanged, confirming the fix only affects the Sunday case and doesn't touch the skip-day-reset or same-day logic.
